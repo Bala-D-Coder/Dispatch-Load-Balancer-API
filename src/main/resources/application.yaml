@@ -23,6 +23,16 @@ spring:
       ddl-auto: validate
     open-in-view: false
 
+logging:
+  pattern:
+    # Boot's default console shape plus the per-request id that RequestLoggingFilter puts in the MDC.
+    # Render shows one flat stream, so this is what ties a service phase line to the HTTP line the same
+    # Postman call produced (and to the X-Request-Id that response carries back); '-' = no request.
+    # Written with plain converters on purpose: the nested ${VAR:-default} tokens Boot uses internally
+    # are resolved by its own logging system, and inside logging.pattern.console they degrade to
+    # %PARSER_ERROR / stray characters.
+    console: "%d{yyyy-MM-dd'T'HH:mm:ss.SSSXXX} %5p [%15.15t] [%X{requestId:--}] %-40.40logger{39} : %m%n%wEx"
+
 management:
   endpoints:
     web:

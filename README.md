@@ -289,8 +289,9 @@ The fleet is deliberately ~10× over-subscribed, so the timed path includes asse
 
 ## Testing
 
-151 tests, all green (`.\mvnw.cmd test`; the wall clock is dominated by Testcontainers start-up —
-~40 s warm, ~130 s cold). Layered so a failure says which layer broke:
+167 tests, all green. `.\mvnw.cmd clean verify` is **58 s warm** (measured 2026-11-21; the wall clock
+is dominated by Testcontainers start-up, and a cold container cache takes ~130 s). Layered so a
+failure says which layer broke:
 
 | Layer | Class | Tests | What it pins |
 |---|---|---|---|
@@ -304,9 +305,10 @@ The fleet is deliberately ~10× over-subscribed, so the timed path includes asse
 | Unit | `RoutePlannerTest` | 7 | Round-trip legs, single-stop and empty cases |
 | Unit | `SampleDataValidationTest` | 5 | The committed sample JSON == the fixtures the unit tests use (third transcription check) |
 | Unit | `DispatchMapperTest` | 5 | DTO ↔ entity ↔ planned-model conversions |
-| Unit | `DispatchServiceImplTest` | 12 | Ingestion semantics with mocked repositories |
+| Unit | `DispatchServiceImplTest` | 18 | Ingestion semantics with mocked repositories, and one log line per call with its phases |
 | Unit | `DotEnvImportTest` | 6 | `.env` really loads, `optional:` is load-bearing, `-D` wins |
 | Unit | `PostmanCollectionTest` | 5 | The Postman collection == the committed samples; every error request asserts its `code` |
+| Unit | `RequestLoggingFilterTest` | 6 | One INFO line per call, id echoed and in the MDC, hostile id discarded, probes at DEBUG |
 | Slice | `DispatchControllerTest` (`@WebMvcTest`) | 19 | The whole error matrix E1–E7 through the servlet chain |
 | Slice | `OrderRepositoryIT` / `VehicleRepositoryIT` (`@DataJpaTest` + Testcontainers) | 8 / 3 | Real SQL, upsert, `findAllById` batching |
 | Integration | `DispatchServiceUpsertIT` | 3 | Cross-request upsert against Postgres, both sides of the API, with the re-planned distance golden |
@@ -314,23 +316,24 @@ The fleet is deliberately ~10× over-subscribed, so the timed path includes asse
 | E2E | `DispatchPlanE2EIT` | 6 | Golden Delhi through HTTP+Postgres; Bangalore spec shape; leg/round-trip self-consistency; byte-identical recompute |
 | E2E | `DispatchFlowE2EIT` | 5 | Upsert, reset, 404/200 boundaries, over-long strings rejected at 400 before the driver |
 | E2E | `ApplicationEndpointsIT` | 4 | `/healthz`, `/v3/api-docs`, `/swagger-ui.html` are really mapped, and the published schema carries the 512/64 widths |
+| E2E | `RequestLoggingIT` | 4 | The filter is in the real chain, `application.yaml`'s pattern really renders the id, and a warm plan call is attributable |
 | E2E perf | `DispatchPerformanceIT` | 2 | The measured number above + the invariant at 5,000 rows |
 
 Container-free subset (no Docker needed):
 
 ```powershell
-.\mvnw.cmd test "-Dtest=!*IT,!DispatchApplicationTests"   # 119 tests
+.\mvnw.cmd test "-Dtest=!*IT,!DispatchApplicationTests"   # 131 tests
 ```
 
 **Coverage:** JaCoCo 0.8.16 is bound to `verify`, so `.\mvnw.cmd clean verify` writes
-`target\site\jacoco\index.html` and fails the build when a threshold slips. Measured on the 150-test
+`target\site\jacoco\index.html` and fails the build when a threshold slips. Measured on the 167-test
 suite above — LINE counters, with `lombok.config` marking generated accessors `@Generated` so
 JaCoCo drops them from the counts:
 
 | Scope | Covered / total lines | Gate |
 |---|---|---|
-| Whole application | 413 / 433 = **95.4 %** | ≥ 75 % |
-| Algorithm + `util` (`service.dispatch.**`, `util`) | 203 / 203 = **100 %** | ≥ 85 % |
+| Whole application | 465 / 485 = **95.9 %** | ≥ 75 % |
+| Algorithm + `util` (`service.dispatch.**`, `util`) | 233 / 233 = **100 %** | ≥ 85 % |
 | `controller` | 7 / 7 = **100 %** | ≥ 80 % |
 | `mapper` (generated `DispatchMapperImpl`) | 123 / 141 = 87.2 % | ungated |
 
@@ -435,8 +438,11 @@ Ordered by what would bite first:
 - **Batch insertion**: ingestion uses `save` per element inside one transaction; a real ingestion
   path for large batches wants `saveAll` with `hibernate.jdbc.batch_size`, which is what the perf
   test's raw JDBC batch already demonstrates at 5,000 rows.
-- **Observability**: only `/healthz` and `/info` are exposed today. A plan-build timer and an
-  unassigned-order counter are the two metrics that would actually be watched.
+- **Observability**: every call now logs one line with its status, duration and an `X-Request-Id`
+  that is echoed back to the client, and `GET /plan` breaks that duration into the four phases — so
+  a slow call can be attributed without a profiler. Metrics stay unexposed (`/healthz` and `/info`
+  only): with no auth on a public host, `/actuator/metrics` would be readable by anyone. The
+  unassigned-order counter is the next thing worth adding.
 - **Solver upgrade**: if the fleet grows to hundreds of vehicles, replace
   `GreedyAssignmentStrategy` (the KD-tree then earns its keep for the nearest-vehicle scan) rather
   than tuning the loop.
