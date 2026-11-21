@@ -1,5 +1,8 @@
 package com.bunny.dispatch.service.dispatch.impl;
 
+import ch.qos.logback.classic.Logger;
+import ch.qos.logback.classic.spi.ILoggingEvent;
+import ch.qos.logback.core.read.ListAppender;
 import com.bunny.dispatch.dto.request.OrderRequest;
 import com.bunny.dispatch.dto.request.OrdersBatchRequest;
 import com.bunny.dispatch.dto.request.VehicleRequest;
@@ -29,15 +32,22 @@ import com.bunny.dispatch.service.dispatch.handler.model.PlannedVehicle;
 import com.bunny.dispatch.service.dispatch.handler.model.RouteLeg;
 import com.bunny.dispatch.service.dispatch.handler.model.UnassignedOrder;
 import com.bunny.dispatch.service.dispatch.handler.model.VehicleRoute;
+import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.extension.ExtendWith;
 import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.mockito.junit.jupiter.MockitoSettings;
+import org.slf4j.LoggerFactory;
 import org.mockito.quality.Strictness;
 
 import java.time.LocalDateTime;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -67,6 +77,40 @@ class DispatchServiceImplTest {
 	private VehicleRepository vehicleRepository;
 
 	private final DispatchMapper mapper = new DispatchMapperImpl();
+
+	// --- P-12.1 log capture: one INFO line per call, every phase field named -------------------
+	private static final Pattern FIELD = Pattern.compile("(\\w+)=([0-9.]+)");
+
+	private ListAppender<ILoggingEvent> logAppender;
+	private Logger serviceLogger;
+
+	@BeforeEach
+	void captureServiceLog() {
+		serviceLogger = (Logger) LoggerFactory.getLogger(DispatchServiceImpl.class);
+		logAppender = new ListAppender<>();
+		logAppender.start();
+		serviceLogger.addAppender(logAppender);
+	}
+
+	@AfterEach
+	void releaseServiceLog() {
+		serviceLogger.detachAppender(logAppender);
+	}
+
+	private List<String> infoLines() {
+		return logAppender.list.stream()
+				.map(ILoggingEvent::getFormattedMessage)
+				.toList();
+	}
+
+	private static Map<String, Double> fieldsOf(String line) {
+		Map<String, Double> parsed = new LinkedHashMap<>();
+		Matcher matcher = FIELD.matcher(line);
+		while (matcher.find()) {
+			parsed.put(matcher.group(1), Double.parseDouble(matcher.group(2)));
+		}
+		return parsed;
+	}
 
 	private DispatchServiceImpl serviceWithRealStrategy() {
 		return new DispatchServiceImpl(orderRepository, vehicleRepository, mapper, new GreedyAssignmentStrategy());
@@ -312,6 +356,102 @@ class DispatchServiceImplTest {
 		verify(orderRepository, times(2)).findAll();
 		verify(vehicleRepository, times(2)).findAll();
 		verify(orderRepository, never()).save(any());
+	}
+
+	// --- P-12.1: the log lines the deployed instance is supposed to produce --------------------
+
+	@Test
+	void ingestOrdersLogsOneLineWithCountsAndBothPhases() {
+		when(orderRepository.findAllById(anyIterable())).thenReturn(List.of());
+
+		serviceWithRealStrategy().ingestOrders(new OrdersBatchRequest(List.of(
+				order("ORD001", 9.0, 9.0, "New Address", 99, Priority.HIGH),
+				order("ORD002", 2.0, 2.0, "B", 5, Priority.HIGH))));
+
+		assertThat(infoLines()).hasSize(1);
+		String line = infoLines().get(0);
+		assertThat(line).startsWith("ingestOrders ");
+		Map<String, Double> fields = fieldsOf(line);
+		assertThat(fields).containsOnlyKeys("received", "inserted", "updated", "validateMs", "upsertMs");
+		assertThat(fields.get("received")).isEqualTo(2);
+		assertThat(fields.get("inserted")).isEqualTo(2);
+		assertThat(fields.get("updated")).isZero();
+		assertThat(fields.get("validateMs")).isGreaterThanOrEqualTo(0);
+		assertThat(fields.get("upsertMs")).isGreaterThanOrEqualTo(0);
+	}
+
+	@Test
+	void ingestVehiclesLogsOneLineWithCountsAndBothPhases() {
+		when(vehicleRepository.findAllById(anyIterable())).thenReturn(List.of());
+
+		serviceWithRealStrategy().ingestVehicles(new VehiclesBatchRequest(List.of(
+				new VehicleRequest("VEH001", 100, 1.0, 1.0, "Depot A"))));
+
+		assertThat(infoLines()).hasSize(1);
+		assertThat(fieldsOf(infoLines().get(0))).containsOnlyKeys(
+				"received", "inserted", "updated", "validateMs", "upsertMs");
+	}
+
+	@Test
+	void buildPlanLogsOneLineCarryingAllFourPhases() {
+		when(orderRepository.findAll()).thenReturn(bangaloreOrders());
+		when(vehicleRepository.findAll()).thenReturn(bangaloreVehicles());
+
+		serviceWithRealStrategy().buildPlan();
+
+		assertThat(infoLines()).hasSize(1);
+		Map<String, Double> fields = fieldsOf(infoLines().get(0));
+		// counts first, then the four phases the plan file promised; the IT re-checks them on a real DB
+		assertThat(fields).containsOnlyKeys("orders", "vehicles", "assigned", "unassigned",
+				"totalLoadKg", "totalDistanceKm", "loadOrdersMs", "loadVehiclesMs",
+				"assignAndRouteMs", "mapMs");
+		assertThat(fields.get("orders")).isEqualTo(2);
+		assertThat(fields.get("assigned")).isEqualTo(2);
+		assertThat(fields.get("unassigned")).isZero();
+		assertThat(fields.get("totalLoadKg")).isEqualTo(30);
+		assertThat(fields.get("totalDistanceKm"))
+				.isCloseTo(BLR_ROUND_TRIP_VEH001 + BLR_ROUND_TRIP_VEH002, withinPercentage(0.5));
+		assertThat(fields.values()).allSatisfy(value -> assertThat(value).isGreaterThanOrEqualTo(0));
+	}
+
+	@Test
+	void clearDataLogsRowsRemovedPerTable() {
+		when(orderRepository.count()).thenReturn(7L);
+		when(vehicleRepository.count()).thenReturn(3L);
+
+		serviceWithRealStrategy().clearData();
+
+		assertThat(infoLines()).hasSize(1);
+		Map<String, Double> fields = fieldsOf(infoLines().get(0));
+		assertThat(fields).containsOnlyKeys("deletedOrders", "deletedVehicles", "deleteMs");
+		assertThat(fields.get("deletedOrders")).isEqualTo(7);
+		assertThat(fields.get("deletedVehicles")).isEqualTo(3);
+	}
+
+	/**
+	 * A rejected batch never reaches the database, so a 400 must produce no service line at all —
+	 * the HTTP line the filter logs is the whole record of it.
+	 */
+	@Test
+	void duplicateKeyInBatchLogsNothing() {
+		OrdersBatchRequest batch = new OrdersBatchRequest(List.of(
+				order("ORD005", 1.0, 1.0, "A", 5, Priority.HIGH),
+				order("ORD005", 2.0, 2.0, "B", 5, Priority.HIGH)));
+
+		assertThatThrownBy(() -> serviceWithRealStrategy().ingestOrders(batch))
+				.isInstanceOf(DuplicateInBatchException.class);
+		assertThat(infoLines()).isEmpty();
+	}
+
+	/** The empty-database 404 is thrown before any phase is logged, for the same reason. */
+	@Test
+	void planWithoutDataLogsNothing() {
+		when(orderRepository.findAll()).thenReturn(List.of());
+		when(vehicleRepository.findAll()).thenReturn(List.of());
+
+		assertThatThrownBy(() -> serviceWithRealStrategy().buildPlan())
+				.isInstanceOf(NoDispatchDataException.class);
+		assertThat(infoLines()).isEmpty();
 	}
 
 }

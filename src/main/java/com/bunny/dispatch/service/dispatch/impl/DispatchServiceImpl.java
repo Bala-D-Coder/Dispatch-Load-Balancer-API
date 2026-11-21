@@ -20,7 +20,11 @@ import com.bunny.dispatch.repository.VehicleRepository;
 import com.bunny.dispatch.service.dispatch.DispatchService;
 import com.bunny.dispatch.service.dispatch.handler.AssignmentStrategy;
 import com.bunny.dispatch.service.dispatch.handler.model.AssignmentResult;
+import com.bunny.dispatch.service.dispatch.handler.model.PlannedOrder;
+import com.bunny.dispatch.service.dispatch.handler.model.PlannedVehicle;
 import com.bunny.dispatch.service.dispatch.handler.model.VehicleRoute;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -31,8 +35,16 @@ import java.util.Set;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
+/**
+ * Orchestration only — selection and routing live in {@code service/dispatch/handler/}, which
+ * deliberately holds no Spring or logging dependency. The one INFO line per call below is
+ * therefore the finest phase detail the deployed logs can give: the algorithm is timed as a
+ * single block from here, not instrumented from inside.
+ */
 @Service
 public class DispatchServiceImpl implements DispatchService {
+
+	private static final Logger log = LoggerFactory.getLogger(DispatchServiceImpl.class);
 
 	private final OrderRepository orderRepository;
 	private final VehicleRepository vehicleRepository;
@@ -53,8 +65,11 @@ public class DispatchServiceImpl implements DispatchService {
 	@Transactional
 	public AckResponse ingestOrders(OrdersBatchRequest batch) {
 		List<OrderRequest> requests = batch.orders();
+		long started = System.nanoTime();
 		requireUniqueKeys(requests, OrderRequest::orderId, "orderId");
+		double validateMs = ms(System.nanoTime() - started);
 
+		long upsertStarted = System.nanoTime();
 		Map<String, OrderEntity> existingById = orderRepository
 				.findAllById(requests.stream().map(OrderRequest::orderId).toList())
 				.stream()
@@ -74,6 +89,8 @@ public class DispatchServiceImpl implements DispatchService {
 				inserted++;
 			}
 		}
+		log.info("ingestOrders received={} inserted={} updated={} validateMs={} upsertMs={}",
+				requests.size(), inserted, updated, validateMs, ms(System.nanoTime() - upsertStarted));
 		return AckResponse.orders(requests.size(), inserted, updated);
 	}
 
@@ -81,8 +98,11 @@ public class DispatchServiceImpl implements DispatchService {
 	@Transactional
 	public AckResponse ingestVehicles(VehiclesBatchRequest batch) {
 		List<VehicleRequest> requests = batch.vehicles();
+		long started = System.nanoTime();
 		requireUniqueKeys(requests, VehicleRequest::vehicleId, "vehicleId");
+		double validateMs = ms(System.nanoTime() - started);
 
+		long upsertStarted = System.nanoTime();
 		Map<String, VehicleEntity> existingById = vehicleRepository
 				.findAllById(requests.stream().map(VehicleRequest::vehicleId).toList())
 				.stream()
@@ -100,22 +120,39 @@ public class DispatchServiceImpl implements DispatchService {
 				inserted++;
 			}
 		}
+		log.info("ingestVehicles received={} inserted={} updated={} validateMs={} upsertMs={}",
+				requests.size(), inserted, updated, validateMs, ms(System.nanoTime() - upsertStarted));
 		return AckResponse.vehicles(requests.size(), inserted, updated);
 	}
 
 	@Override
 	@Transactional(readOnly = true)
 	public DispatchPlanResponse buildPlan() {
+		long loadOrdersStarted = System.nanoTime();
 		List<OrderEntity> orders = orderRepository.findAll();
+		double loadOrdersMs = ms(System.nanoTime() - loadOrdersStarted);
+
+		long loadVehiclesStarted = System.nanoTime();
 		List<VehicleEntity> vehicles = vehicleRepository.findAll();
+		double loadVehiclesMs = ms(System.nanoTime() - loadVehiclesStarted);
+
 		if (orders.isEmpty() && vehicles.isEmpty()) {
 			throw new NoDispatchDataException("No dispatch data available. Post orders and vehicles first.");
 		}
 
-		AssignmentResult result = assignmentStrategy.assign(
-				orders.stream().map(mapper::toPlanned).toList(),
-				vehicles.stream().map(mapper::toPlanned).toList());
+		// mapping is split from selection/routing because the two have opposite costs: mapping is
+		// proportional to rows, assignment to rows x vehicles. Summed they would hide which one grew.
+		long mapNanos = 0;
+		long mapStarted = System.nanoTime();
+		List<PlannedOrder> plannedOrders = orders.stream().map(mapper::toPlanned).toList();
+		List<PlannedVehicle> plannedVehicles = vehicles.stream().map(mapper::toPlanned).toList();
+		mapNanos += System.nanoTime() - mapStarted;
 
+		long assignStarted = System.nanoTime();
+		AssignmentResult result = assignmentStrategy.assign(plannedOrders, plannedVehicles);
+		double assignAndRouteMs = ms(System.nanoTime() - assignStarted);
+
+		mapStarted = System.nanoTime();
 		List<VehiclePlanDto> dispatchPlan = result.routes().stream()
 				.map(this::toVehiclePlanDto)
 				.toList();
@@ -133,16 +170,26 @@ public class DispatchServiceImpl implements DispatchService {
 				result.routes().stream().mapToInt(VehicleRoute::totalLoad).sum(),
 				totalDistanceKm,
 				VehiclePlanDto.formatKm(totalDistanceKm));
+		mapNanos += System.nanoTime() - mapStarted;
+
+		log.info("buildPlan orders={} vehicles={} assigned={} unassigned={} totalLoadKg={} totalDistanceKm={}"
+						+ " loadOrdersMs={} loadVehiclesMs={} assignAndRouteMs={} mapMs={}",
+				orders.size(), vehicles.size(), totals.assignedOrderCount(), unassigned.size(),
+				totals.totalLoadKg(), totalDistanceKm,
+				loadOrdersMs, loadVehiclesMs, assignAndRouteMs, ms((long) mapNanos));
 		return new DispatchPlanResponse(dispatchPlan, unassigned, totals);
 	}
 
 	@Override
 	@Transactional
 	public ClearDataResponse clearData() {
+		long started = System.nanoTime();
 		long orders = orderRepository.count();
 		long vehicles = vehicleRepository.count();
 		orderRepository.deleteAllInBatch();
 		vehicleRepository.deleteAllInBatch();
+		log.info("clearData deletedOrders={} deletedVehicles={} deleteMs={}",
+				orders, vehicles, ms(System.nanoTime() - started));
 		return ClearDataResponse.of(orders, vehicles);
 	}
 
@@ -165,6 +212,11 @@ public class DispatchServiceImpl implements DispatchService {
 				throw new DuplicateInBatchException("Duplicate " + keyName + " in request: " + key);
 			}
 		}
+	}
+
+	/** Two decimals: enough to separate a 0.02 ms in-memory phase from a 40 ms query, cheap enough to always call. */
+	private static double ms(long nanos) {
+		return Math.round(nanos / 10_000) / 100.0;
 	}
 
 }

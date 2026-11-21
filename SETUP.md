@@ -97,22 +97,48 @@ Expect `23` orders assigned / `495 kg` / `171 km`, and `7` LOW-priority orders (
 `unassignedOrders` — the Delhi sample is 645 kg of demand against a 500 kg fleet, so that shortfall
 is a property of the data, not a bug. `API.md` documents every field of the answer.
 
+## 5b. What the logs show
+
+Every call prints one HTTP line, and the service prints one line per call with its phases. The id is
+generated per request and echoed back as an `X-Request-Id` response header, so a Postman run maps to
+exactly the lines it produced (`GET /healthz` and `/info` log at DEBUG so a keep-alive pinger cannot
+flood this):
+
+```text
+2026-11-21T17:47:26.897+05:30  INFO [           main] [59ee2d0a-1494-425e-bd88-4e409506804f] c.b.d.s.d.impl.DispatchServiceImpl       : ingestVehicles received=5 inserted=5 updated=0 validateMs=0.01 upsertMs=48.82
+2026-11-21T17:47:27.141+05:30  INFO [           main] [4a7fd5c0-86ad-4366-9025-1e192de913ad] c.b.d.s.d.impl.DispatchServiceImpl       : ingestOrders received=30 inserted=30 updated=0 validateMs=0.07 upsertMs=173.52
+2026-11-21T17:47:27.258+05:30  INFO [           main] [4a7fd5c0-86ad-4366-9025-1e192de913ad] c.b.d.config.RequestLoggingFilter        : POST /api/dispatch/orders status=200 durationMs=313 requestId=4a7fd5c0-86ad-4366-9025-1e192de913ad
+2026-11-21T17:47:27.304+05:30  INFO [           main] [c1f0668c-040a-42a3-bf96-d69a97104b8b] c.b.d.s.d.impl.DispatchServiceImpl       : buildPlan orders=30 vehicles=5 assigned=23 unassigned=7 totalLoadKg=495 totalDistanceKm=170.55785002480366 loadOrdersMs=13.43 loadVehiclesMs=9.37 assignAndRouteMs=1.02 mapMs=0.42
+2026-11-21T17:47:27.315+05:30  INFO [           main] [c1f0668c-040a-42a3-bf96-d69a97104b8b] c.b.d.config.RequestLoggingFilter        : GET /api/dispatch/plan status=200 durationMs=38 requestId=c1f0668c-040a-42a3-bf96-d69a97104b8b
+```
+
+Pasted verbatim from `.\mvnw.cmd clean verify` on 2026-11-21, in the order the build printed them:
+the Delhi fixtures above are loaded and planned by `DispatchPlanE2EIT` through real HTTP and real
+Postgres, so those are the same two calls §5 makes, from the same data. A `spring-boot:run` session
+prints the same fields with different numbers (its first plan call also pays for JIT).
+
+`[-]` in the id column means the line belongs to no request (startup, or a direct service call). The
+four `…Ms` fields on the `buildPlan` line are what a slow call is attributed to; `assignAndRouteMs`
+covers selection and routing together, because `handler/` is deliberately framework-free and cannot
+time itself. On this run the two `findAll()` reads (13.43 + 9.37 = 22.80 ms) are 22× the algorithm
+(1.02 ms) — the load, not the routing, is what a growing dataset makes expensive.
+
 ## 6. Run the tests
 
 ```powershell
-.\mvnw.cmd clean verify                                      # 151 tests + the coverage gate — needs Docker
-.\mvnw.cmd test                                              # the same 151 tests, no packaging or gate
-.\mvnw.cmd test "-Dtest=!*IT,!DispatchApplicationTests"      # 119 tests — no Docker needed
+.\mvnw.cmd clean verify                                      # 167 tests + the coverage gate — needs Docker
+.\mvnw.cmd test                                              # the same 167 tests, no packaging or gate
+.\mvnw.cmd test "-Dtest=!*IT,!DispatchApplicationTests"      # 131 tests — no Docker needed
 ```
 
-The full suite is 151 tests. 32 of them boot a Spring context against a real Postgres container
+The full suite is 167 tests. 36 of them boot a Spring context against a real Postgres container
 (Testcontainers), so `.\mvnw.cmd test` requires Docker Desktop to be running — Surefire is
 configured to include `**/*IT.java` precisely so CI cannot silently skip them.
 
 The second command is the container-free subset: it excludes every `*IT` class plus
 `DispatchApplicationTests`, which is the only remaining class that loads a context. That list is not
 a guess — `@SpringBootTest`, `@DataJpaTest` and `TestcontainersConfiguration` appear in exactly
-those classes and nowhere else in `src/test`, so the 119 tests that survive the filter never touch a
+those classes and nowhere else in `src/test`, so the 131 tests that survive the filter never touch a
 container (the remaining ones are plain JUnit, `@WebMvcTest` with a mocked service, or bean-
 validation and JSON-binding tests).
 
