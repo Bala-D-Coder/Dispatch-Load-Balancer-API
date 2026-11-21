@@ -1,0 +1,6 @@
+{
+  "orders": [
+    { "orderId": "ORD001", "latitude": 12.9716, "longitude": 77.5946, "address": "MG Road, Bangalore, Karnataka, India", "packageWeight": 10, "priority": "HIGH" },
+    { "orderId": "ORD002", "latitude": 13.0827, "longitude": 80.2707, "address": "Anna Salai, Chennai, Tamil Nadu, India", "packageWeight": 20, "priority": "MEDIUM" }
+  ]
+}
