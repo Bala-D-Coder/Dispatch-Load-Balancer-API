@@ -1,0 +1,36 @@
+spring:
+  application:
+    name: dispatch-load-balancer-api
+  docker:
+    compose:
+      enabled: false
+  # A local .env is loaded as a properties file — no dotenv dependency needed. 'optional:' keeps a
+  # fresh clone bootable without one, and imported file values rank BELOW OS environment variables
+  # and -D system properties, so deployment env always wins over a stale local file.
+  config:
+    import: "optional:file:.env[.properties]"
+  datasource:
+    url: ${DB_URL}
+    username: ${DB_USERNAME}
+    password: ${DB_PASSWORD}
+  flyway:
+    enabled: true
+  jackson:
+    deserialization:
+      fail-on-unknown-properties: true
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    open-in-view: false
+
+management:
+  endpoints:
+    web:
+      base-path: /
+      exposure:
+        include: health,info
+      path-mapping:
+        health: healthz
+  endpoint:
+    health:
+      show-details: never

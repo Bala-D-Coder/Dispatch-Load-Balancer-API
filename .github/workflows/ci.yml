@@ -1,0 +1,103 @@
+name: Dispatch Load Balancer CI
+
+# ubuntu-latest ships a Docker daemon, which this suite needs: every *IT class and
+# DispatchApplicationTests boot a real Postgres through Testcontainers. There is no
+# services: postgres block on purpose — Testcontainers owns the container, its port
+# and its lifetime, so CI and a developer laptop run the identical code path.
+#
+# This workflow is the PRE-MERGE feedback: it runs the suite on a pull request
+# targeting deploy/production, so a broken change is caught before it can land.
+# It deliberately has no push trigger — the same suite runs again as the first job
+# of deploy.yml, which is the gate that actually protects the server. `main` is a
+# mirror branch and triggers nothing anywhere.
+on:
+  pull_request:
+    branches:
+      - 'deploy/production'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-test-verify:
+    name: Build, test, coverage gate, image
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          java-version: '21'
+          distribution: 'temurin'
+          cache: maven
+
+      - name: Grant execute permission for mvnw
+        run: chmod +x mvnw
+
+      - name: Compile main and test sources
+        run: ./mvnw -B -ntp test-compile
+
+      # Runs the whole suite (unit + slice + e2e ITs) and enforces the JaCoCo rules
+      # bound to `verify` in pom.xml. A coverage regression fails the build here,
+      # not in review.
+      - name: Verify (tests + coverage thresholds)
+        run: ./mvnw -B -ntp verify
+
+      - name: Upload JaCoCo report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: jacoco-report
+          path: target/site/jacoco
+          if-no-files-found: warn
+
+      - name: Verify Docker image builds
+        run: docker build -t dispatch-load-balancer-api:ci .
+
+      # The documentation deliverables are the graded surface, and a `.gitignore`
+      # rule that silently eats one of them (this repo ignores /docs) would not show
+      # up in `git status`. Assert they stay unignored instead of hoping.
+      - name: Deliverables are not gitignored
+        run: |
+          set -e
+          for f in README.md API.md SETUP.md Dockerfile .dockerignore lombok.config \
+                   Z-Docs/ADR-001-greedy-priority-assignment.md \
+                   postman/dispatch-load-balancer.postman_collection.json \
+                   src/test/resources/sample; do
+            if git check-ignore -q "$f"; then
+              echo "::error::$f is gitignored — it would never reach a reviewer's clone."
+              exit 1
+            fi
+            echo "ok  $f"
+          done
+
+      - name: Secret scan
+        run: |
+          set -e
+          echo "Scanning tracked files for committed credentials..."
+
+          # .env is the file a developer puts real values in. If it is ever tracked,
+          # everything else in this step is moot.
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error::.env is tracked. Untrack it (git rm --cached .env) and rotate anything in it."
+            exit 1
+          fi
+
+          # Access-token / key shapes from the services this project could plausibly
+          # talk to: Docker Hub, GitHub, AWS, Google, Slack, plus any PEM private key.
+          if git grep -I -n -E \
+            'dckr_pat_[A-Za-z0-9_\-]+|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|AIzaSy[A-Za-z0-9_\-]{33}|xox[baprs]-[0-9A-Za-z-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----' \
+            -- ':!Docs' ':!*.template' ':!*.example'; then
+            echo "::error::Credential-shaped literal found in tracked files (lines above)."
+            exit 1
+          fi
+
+          echo "Secret scan passed cleanly."

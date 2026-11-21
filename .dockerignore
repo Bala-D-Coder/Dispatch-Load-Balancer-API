@@ -1,0 +1,31 @@
+# The build context is pom.xml + src/ and nothing else. Everything below is either
+# irrelevant to the jar or must never reach an image layer.
+target/
+.git/
+.gitattributes
+.mvn/wrapper/maven-wrapper.jar
+
+# Local secrets and local-only material. .env in particular is the one file that,
+# if it were ever COPY'd, would bake credentials into a distributable layer.
+.env
+.env.local
+data/
+scratch/
+
+# Docs, plans and the stray Initializr drop: not inputs to the build.
+docs/
+Docs/
+Implementation_plan/
+implementation_plan/
+Z-Docs/
+postman/
+dispatch-load-balancer-api/
+HELP.md
+requirements.txt
+API.md
+README.md
+SETUP.md
+compose.yaml
+
+# CI reads these from the repo, the image does not need them.
+.github/
