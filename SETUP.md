@@ -1,5 +1,7 @@
 # Setup
 
+
+
 Everything here was run on Windows 11 with PowerShell. Commands are marked `[powershell]`.
 
 ## 1. Prerequisites
