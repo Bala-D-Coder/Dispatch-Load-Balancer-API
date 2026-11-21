@@ -339,6 +339,26 @@ one real gap JaCoCo found here was a genuine one: the *vehicle* half of the upse
 order half did. `reingestVehicle_countsUpdatedAndReplacesValuesOnTheManagedEntity` and
 `reingestVehiclePreservesCreatedAtAndCapacityFeedsNextPlan` are now the fence for it.
 
+## Branches and pipelines
+
+One branch ships, and the branch that ships is the branch that is tested. GitHub resolves workflow
+files from the **pushed** branch, so a branch absent from every trigger list runs nothing — that is
+the mechanism, not a convention:
+
+| Branch | Push | Pull request into it |
+|---|---|---|
+| `deploy/production` | `deploy.yml`: **`verify` (the full suite + coverage gate) → migration-guard → build image → deploy**, the last job waiting on the `production` environment's approval | `ci.yml` runs the suite, so a broken change is caught before it lands |
+| `deploy/staging` | same pipeline, resolves to the staging environment — kept in the trigger list, unused until a staging service exists | — |
+| `main` | **nothing** — a mirror branch, deliberately not named in any trigger | nothing |
+| anything else (`Impl`, `local_me`, …) | nothing | `ci.yml` runs when the PR targets `deploy/production` |
+
+Two switches, both in GitHub settings rather than in YAML, so the pipeline can be wired before the
+infrastructure exists: `vars.DEPLOY_ENABLED` must be the literal `true` or every job after `verify`
+is skipped (tests still run, nothing ships, no red X over a missing secret), and the `production`
+environment needs *Required reviewers* for the deploy job to pause for you. `concurrency` uses
+`cancel-in-progress: false` here on purpose — cancelling a test run that a newer push superseded is
+good hygiene, cancelling a half-finished deployment is not.
+
 ## Data model
 
 Two tables, one Flyway migration (`V1__init_schema.sql`), natural keys as primary keys:
@@ -366,7 +386,7 @@ stored — the plan is derived, which is what makes D4 (no cache) safe.
 | Pagination or streaming of the plan | The response is bounded by rows in the database, and at 5,000 orders it is still ~100 ms. First thing to add when that stops being true. |
 | Asynchronous ingestion / a job for plan building | Two endpoints, both fast enough synchronously. |
 | Persistence of plans, drivers, live positions | Out of scope for the brief; would need an identity model this API does not have. |
-| Deploying to a host | `Dockerfile`, `ci.yml` and `deploy.yml` exist and the image is verified locally, but `deploy.yml` is inert until someone adds the Render secrets — so this repo quotes no live URL, because there is none. |
+| Deploying to a host | `Dockerfile`, `ci.yml` and `deploy.yml` exist and the image is verified locally. `deploy.yml` runs the suite first and then stops at `skipped` until the Render secrets and `vars.DEPLOY_ENABLED=true` are added — so this repo quotes no live URL, because there is none. |
 | JaCoCo BRANCH thresholds | Deliberately LINE-only: the 20 uncovered lines are a code generator's null guards and `main()`, and a branch rule would gate code I did not write. |
 
 ## How to read the code in ten minutes
@@ -413,8 +433,11 @@ Ordered by what would bite first:
 - **Time zones / locales**: the distance key holds bit patterns, not rendered numbers, so no locale
   can vary it; the same discipline is needed for any future timestamped data (render nothing that is
   only ever compared).
-- **Deploying**: `.github/workflows/deploy.yml` is inert by design — it needs Render secrets and a
-  `vars.HEALTHCHECK_URL` before it does anything, and it never assumes a hostname. Its
-  `migration-guard` job is the enforceable half: it refuses a change set that adds a SQL file whose
-  version is below the highest one already shipped, which is what keeps Flyway from skipping over an
-  already-applied migration in production.
+- **Deploying**: `.github/workflows/deploy.yml` is wired to one branch — `deploy/production` — and
+  its first job is the test suite itself, so an image is never built from code that failed `verify`.
+  It still cannot reach a server until the Render secrets exist and the repository variable
+  `DEPLOY_ENABLED` is set to `true`; until then every job after `verify` reports `skipped`, which
+  keeps a merge green-but-not-deployed instead of red at Docker login. It never assumes a hostname:
+  the post-deploy probe reads `vars.HEALTHCHECK_URL`. Its `migration-guard` job is the enforceable
+  half: it refuses a change set that adds a SQL file whose version is below the highest one already
+  shipped, which is what keeps Flyway from skipping over an already-applied migration in production.

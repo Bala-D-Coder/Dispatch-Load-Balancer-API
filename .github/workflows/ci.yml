@@ -4,11 +4,16 @@ name: Dispatch Load Balancer CI
 # DispatchApplicationTests boot a real Postgres through Testcontainers. There is no
 # services: postgres block on purpose — Testcontainers owns the container, its port
 # and its lifetime, so CI and a developer laptop run the identical code path.
+#
+# This workflow is the PRE-MERGE feedback: it runs the suite on a pull request
+# targeting deploy/production, so a broken change is caught before it can land.
+# It deliberately has no push trigger — the same suite runs again as the first job
+# of deploy.yml, which is the gate that actually protects the server. `main` is a
+# mirror branch and triggers nothing anywhere.
 on:
-  push:
-    branches: [ main ]
   pull_request:
-    branches: [ main ]
+    branches:
+      - 'deploy/production'
   workflow_dispatch:
 
 permissions:
