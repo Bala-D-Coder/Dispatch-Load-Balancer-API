@@ -152,7 +152,7 @@ Per-class counts and what each layer proves are in `README.md`.
 | `src/main/java/com/bunny/dispatch/service/dispatch/handler/` | The assignment algorithm — no Spring imports in this package |
 | `src/main/resources/db/migration/` | The one Flyway migration |
 | `Dockerfile`, `.dockerignore` | Multi-stage image build (non-root, `/healthz` healthcheck) |
-| `.github/workflows/ci.yml` | PRs into `deploy/production`: `verify` (suite + coverage gate), image build, deliverable/gitignore guard, secret scan |
-| `.github/workflows/deploy.yml`, `.github/scripts/check-migration-order.sh` | `deploy/production` pipeline: `verify` first, then migration guard, image build, Render deploy behind the `production` environment approval — **skips everything after `verify` until the secrets and `vars.DEPLOY_ENABLED=true` exist** (`README.md` § Branches and pipelines) |
+| `.github/workflows/ci.yml` | PRs into `deploy/production`: `verify` (suite + coverage gate), a Dockerfile build check, deliverable/gitignore guard, secret scan |
+| `.github/workflows/deploy.yml`, `.github/scripts/check-migration-order.sh` | `deploy/production` pipeline: `verify` first, then the migration guard, then `build-and-push` (Docker Hub) and the Render deploy hook behind the `production` environment approval — **skips everything after `verify` until the Docker Hub repo, the Render *Existing Image* service, the secrets and `vars.DEPLOY_ENABLED=true` exist**. CI builds the image; Render only runs it (`README.md` § Branches and pipelines) |
 | `Z-Docs/ADR-001-greedy-priority-assignment.md` | Why greedy-priority-then-nearest, and what was rejected |
 | `Implementation_plan/`, `Docs/` | Local working notes and the company template references — **both are gitignored, so they are not in a clone and are not part of the deliverable** |

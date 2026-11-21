@@ -75,7 +75,8 @@ Multi-stage (`maven:3.9-eclipse-temurin-21` → `eclipse-temurin:21-jre-alpine`,
 a cold dependency cache), runs as the non-root `appuser`, and its `HEALTHCHECK` polls `/healthz`.
 The build deliberately does **not** run the tests: every `*IT` needs a Docker daemon inside the build
 container, which is a CI concern, so `.github/workflows/ci.yml` runs `./mvnw -B verify` and *then*
-`docker build`.
+`docker build`. Deployment uses the same file: `deploy.yml` builds it on a GitHub runner, pushes the
+image to Docker Hub, and Render runs that image — the build is never handed to the host.
 
 ## Prerequisites and stack
 
@@ -347,10 +348,17 @@ the mechanism, not a convention:
 
 | Branch | Push | Pull request into it |
 |---|---|---|
-| `deploy/production` | `deploy.yml`: **`verify` (the full suite + coverage gate) → migration-guard → build image → deploy**, the last job waiting on the `production` environment's approval | `ci.yml` runs the suite, so a broken change is caught before it lands |
+| `deploy/production` | `deploy.yml`: **`verify` (the full suite + coverage gate) → migration-guard → `build-and-push` → deploy hook**, the last job waiting on the `production` environment's approval | `ci.yml` runs the suite, so a broken change is caught before it lands |
 | `deploy/staging` | same pipeline, resolves to the staging environment — kept in the trigger list, unused until a staging service exists | — |
 | `main` | **nothing** — a mirror branch, deliberately not named in any trigger | nothing |
 | anything else (`Impl`, `local_me`, …) | nothing | `ci.yml` runs when the PR targets `deploy/production` |
+
+The image is ours, not the host's: `build-and-push` runs the committed `Dockerfile` on a GitHub
+runner and publishes it to Docker Hub under `latest`, `production` and `production-<short sha>`, and the
+Render service is created as **Existing Image** pointing at `…/dispatch-load-balancer-api:production`.
+Render re-resolves that tag only when it is told to deploy, never on its own, which is why the deploy
+hook is the pipeline's last step — no hook call, no new code on the server. `provenance: false` is on
+the push because an index carrying only attestations is not something Render can consume.
 
 Two switches, both in GitHub settings rather than in YAML, so the pipeline can be wired before the
 infrastructure exists: `vars.DEPLOY_ENABLED` must be the literal `true` or every job after `verify`
@@ -386,7 +394,7 @@ stored — the plan is derived, which is what makes D4 (no cache) safe.
 | Pagination or streaming of the plan | The response is bounded by rows in the database, and at 5,000 orders it is still ~100 ms. First thing to add when that stops being true. |
 | Asynchronous ingestion / a job for plan building | Two endpoints, both fast enough synchronously. |
 | Persistence of plans, drivers, live positions | Out of scope for the brief; would need an identity model this API does not have. |
-| Deploying to a host | `Dockerfile`, `ci.yml` and `deploy.yml` exist and the image is verified locally. `deploy.yml` runs the suite first and then stops at `skipped` until the Render secrets and `vars.DEPLOY_ENABLED=true` are added — so this repo quotes no live URL, because there is none. |
+| Deploying to a host | `Dockerfile`, `ci.yml` and `deploy.yml` exist and the image is verified locally. `deploy.yml` runs the suite first and then stops at `skipped` until the Docker Hub repository, the Render *Existing Image* service and the secrets exist and `vars.DEPLOY_ENABLED=true` — so this repo quotes no live URL, because there is none. |
 | JaCoCo BRANCH thresholds | Deliberately LINE-only: the 20 uncovered lines are a code generator's null guards and `main()`, and a branch rule would gate code I did not write. |
 
 ## How to read the code in ten minutes
@@ -434,10 +442,12 @@ Ordered by what would bite first:
   can vary it; the same discipline is needed for any future timestamped data (render nothing that is
   only ever compared).
 - **Deploying**: `.github/workflows/deploy.yml` is wired to one branch — `deploy/production` — and
-  its first job is the test suite itself, so an image is never built from code that failed `verify`.
-  It still cannot reach a server until the Render secrets exist and the repository variable
-  `DEPLOY_ENABLED` is set to `true`; until then every job after `verify` reports `skipped`, which
-  keeps a merge green-but-not-deployed instead of red at Docker login. It never assumes a hostname:
-  the post-deploy probe reads `vars.HEALTHCHECK_URL`. Its `migration-guard` job is the enforceable
-  half: it refuses a change set that adds a SQL file whose version is below the highest one already
-  shipped, which is what keeps Flyway from skipping over an already-applied migration in production.
+  its first job is the test suite itself, so CI never publishes an image built from code that failed
+  `verify`, and Render is only ever pointed at the image that run produced. It still cannot reach a
+  server until a Docker Hub repository and a Render *Existing Image* service exist, the
+  secrets below are in GitHub, and the repository variable `DEPLOY_ENABLED` is set to `true`; until
+  then every job after `verify` reports `skipped`, which keeps a merge green-but-not-deployed instead
+  of red on a missing key. It never assumes a hostname: the post-deploy probe reads
+  `vars.HEALTHCHECK_URL`. Its `migration-guard` job is the enforceable half: it refuses a change set
+  that adds a SQL file whose version is below the highest one already shipped, which is what keeps
+  Flyway from skipping over an already-applied migration in production.
