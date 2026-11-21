@@ -1,5 +1,7 @@
 # Dispatch Load Balancer API
 
+
+
 A Spring Boot service that allocates delivery orders to a capacity-limited fleet and returns a
 dispatch plan. Orders are assigned **HIGH priority first**, each to the **nearest feasible vehicle**
 by Haversine distance measured from that vehicle's current route tip; every vehicle's route is then
