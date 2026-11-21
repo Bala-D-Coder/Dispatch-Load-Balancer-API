@@ -3,26 +3,39 @@ name: Build & Deploy Dispatch API to Render
 # ---------------------------------------------------------------------------
 # ONE BRANCH SHIPS: `deploy/production`. A push to it — a merged PR or a direct
 # push, GitHub cannot tell them apart at the trigger — runs the full test suite
-# first (verify job) and only then builds and deploys. `main` is a mirror branch
-# that triggers nothing at all, and a push to a personal branch (Impl, local_me)
+# first (verify job) and only then deploys. `main` is a mirror branch that
+# triggers nothing at all, and a push to a personal branch (Impl, local_me)
 # triggers nothing either: GitHub only reads workflow files from the branch being
 # pushed, and no trigger list names those branches.
 #
 # `deploy/staging` stays in the trigger list, unused until an environment exists
 # for it — the branch-name-to-environment mapping below already handles it.
 #
-# STILL NOT CONFIGURED. Nothing can reach a server until someone:
-#   1. adds the secrets listed below,
-#   2. creates a Render web service that pulls the Docker image,
-#   3. sets the repository variable DEPLOY_ENABLED to `true`.
-# Until step 3, every job after verify reports `skipped`, so a merge to
+# HOW THE CONTAINER GETS THERE: we build it, Render only runs it. This workflow
+# builds the committed Dockerfile on a GitHub runner and pushes the image to
+# Docker Hub under three tags (see build-and-push), then calls the service's
+# deploy hook. In the Render dashboard the service is therefore created as
+# "Existing Image", pointing at:
+#     docker.io/<DOCKER_USERNAME>/dispatch-load-balancer-api:production
+# Render re-resolves that tag on every deploy it is told to do, and does NOT
+# redeploy on its own when a new image appears under the same tag — which is
+# exactly why the hook is the last step here and not an afterthought.
+#
+# STILL NOT CONFIGURED. Nothing reaches a server until someone:
+#   1. creates a Docker Hub repository (public, or private with Render's Docker
+#      Hub credentials linked in account settings),
+#   2. creates the Render "Existing Image" web service above,
+#   3. adds the secrets listed below,
+#   4. sets the repository variable DEPLOY_ENABLED to `true`.
+# Until step 4, every job after verify reports `skipped`, so a merge to
 # deploy/production is green-but-deploys-nothing instead of red at Docker login.
 #
 # Required secrets: DOCKER_USERNAME, DOCKER_PASSWORD (a Docker Hub *access
-# token*), RENDER_API_KEY, RENDER_SERVICE_ID_{STAGING,PRODUCTION},
+# token*, not the account password), RENDER_API_KEY,
+# RENDER_SERVICE_ID_{STAGING,PRODUCTION},
 # RENDER_DEPLOY_HOOK_{STAGING,PRODUCTION}, DB_URL, DB_USERNAME, DB_PASSWORD.
-# Required vars:    DEPLOY_ENABLED=true, HEALTHCHECK_URL (post-deploy probe and
-#                   the Environment URL both read it).
+# Required vars:    DEPLOY_ENABLED=true, HEALTHCHECK_URL (the post-deploy probe
+#                   and the Environment URL both read it).
 # ---------------------------------------------------------------------------
 on:
   push:
@@ -102,7 +115,7 @@ jobs:
           if [ "$ENABLED" = "true" ]; then
             echo "Deployment enabled for ${{ github.ref_name }}."
           else
-            echo "::notice::vars.DEPLOY_ENABLED is '${ENABLED:-unset}' (needs the literal 'true'), so the image build and the Render call are both skipped. Tests still ran."
+            echo "::notice::vars.DEPLOY_ENABLED is '${ENABLED:-unset}' (needs the literal 'true'), so the image build, the env sync and the deploy hook are all skipped. Tests still ran."
           fi
 
   # ---------------------------------------------------------------
@@ -141,7 +154,7 @@ jobs:
         run: bash .github/scripts/check-migration-order.sh "${{ steps.base.outputs.sha }}" HEAD
 
   # ---------------------------------------------------------------
-  # Build Docker image and push to Docker Hub
+  # Build the Dockerfile here and publish it — Render is never given source
   # ---------------------------------------------------------------
   build-and-push:
     name: Build & Push Image
@@ -157,9 +170,6 @@ jobs:
     timeout-minutes: 45
     # No `environment:` here on purpose: the approval gate sits on the job that
     # touches the live service. Declaring it on both jobs would prompt you twice.
-
-    outputs:
-      image_tag: ${{ steps.meta.outputs.version }}
 
     steps:
       - name: Checkout source
@@ -190,6 +200,9 @@ jobs:
           echo "4. Verify DOCKER_USERNAME matches the Docker Hub account"
           exit 1
 
+      # Three tags per build. `production` is what the Render service points at and
+      # is deliberately mutable; `production-<short sha>` and `latest` are the traceable
+      # handles, so a run can be traced to the exact image afterwards.
       - name: Extract Docker metadata
         id: meta
         uses: docker/metadata-action@v5
@@ -213,6 +226,8 @@ jobs:
             APP_VERSION=${{ github.sha }}
           cache-from: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/dispatch-load-balancer-api:buildcache-${{ needs.setup.outputs.env_tag }}
           cache-to: type=registry,ref=${{ secrets.DOCKER_USERNAME }}/dispatch-load-balancer-api:buildcache-${{ needs.setup.outputs.env_tag }},mode=max
+          # Render cannot consume an index that carries only provenance
+          # attestations; push a plain image manifest.
           provenance: false
 
       - name: Verify image was pushed
@@ -221,12 +236,23 @@ jobs:
           echo "Tags: ${{ steps.meta.outputs.tags }}"
 
   # ---------------------------------------------------------------
-  # Sync env vars to Render and trigger redeployment
+  # Sync env vars to Render, then point its already-built image at the world
   # ---------------------------------------------------------------
+  # The service was created as "Existing Image" from the tag pushed above, so this
+  # job's whole job is config + a nudge: Render pulls the new contents of that tag
+  # when the hook fires, and never before. That is why nothing here can ship code
+  # that did not pass verify in the same run.
   deploy:
     name: Trigger Render Deploy
     runs-on: ubuntu-latest
     needs: [setup, verify, build-and-push]
+    # build-and-push already implies verify and migration-guard were green; a
+    # failed or skipped build means no hook call, so no stale-code redeploy.
+    if: >-
+      always() && needs.setup.result == 'success' &&
+      needs.verify.result == 'success' &&
+      needs.build-and-push.result == 'success' &&
+      needs.setup.outputs.enabled == 'true'
     timeout-minutes: 15
     # The approval gate: with "Required reviewers" on the production environment,
     # this job waits until you approve it, and the health URL shows on the run page.
@@ -246,11 +272,14 @@ jobs:
             echo "deploy_hook=${{ secrets.RENDER_DEPLOY_HOOK_STAGING }}" >> "$GITHUB_OUTPUT"
           fi
 
-      # These are the only four values the application reads. application.yaml
-      # resolves DB_URL / DB_USERNAME / DB_PASSWORD (with localhost dev defaults),
-      # and PORT is what the Dockerfile forwards to server.port. OS environment
-      # variables outrank the optional .env import by design, so this is the
-      # authoritative source of config in a deployed container.
+      # The three values the application reads for its datasource. application.yaml
+      # resolves DB_URL / DB_USERNAME / DB_PASSWORD (with localhost dev defaults), and
+      # OS environment variables outrank the optional .env import by design, so this
+      # is the authoritative source of config in a deployed container.
+      #
+      # PORT is deliberately NOT in this list. Render assigns it per container and the
+      # image already honours it (-Dserver.port="${PORT:-8080}"); pinning it here would
+      # make the app listen on 8080 while the platform routes to the port it handed out.
       - name: Sync env vars to Render
         env:
           IN_DB_URL: ${{ secrets.DB_URL }}
@@ -265,7 +294,6 @@ jobs:
           PAYLOAD=$(python3 - <<'PYEOF'
           import json, os
           envs = [
-              {"key": "PORT",        "value": "8080"},
               {"key": "DB_URL",      "value": os.environ["IN_DB_URL"]},
               {"key": "DB_USERNAME", "value": os.environ["IN_DB_USERNAME"]},
               {"key": "DB_PASSWORD", "value": os.environ["IN_DB_PASSWORD"]},
@@ -380,9 +408,12 @@ jobs:
           echo " Deployment Complete"
           echo "================================"
           echo " Environment : ${{ needs.setup.outputs.env_tag }}"
-          echo " Image       : ${{ secrets.DOCKER_USERNAME }}/dispatch-load-balancer-api:${{ needs.setup.outputs.env_tag }}"
+          echo " Built by    : GitHub Actions (docker/build-push-action)"
           echo " Commit SHA  : ${{ github.sha }}"
-          if [ -n "${{ vars.APP_URL }}" ]; then
-            echo " URL         : ${{ vars.APP_URL }}"
+          # metadata-action's type=sha tags with the SHORT (7-char) commit, so this is
+          # the tag that was actually pushed — a full SHA here would name nothing.
+          echo " Image       : ${{ secrets.DOCKER_USERNAME }}/dispatch-load-balancer-api:${{ needs.setup.outputs.env_tag }}-${GITHUB_SHA::7}"
+          if [ -n "${{ vars.HEALTHCHECK_URL }}" ]; then
+            echo " Health URL  : ${{ vars.HEALTHCHECK_URL }}"
           fi
           echo "================================"
